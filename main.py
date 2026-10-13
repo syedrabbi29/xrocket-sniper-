@@ -13,7 +13,6 @@ from flask import Flask
 from telethon import TelegramClient, events, utils
 from telethon.errors import FloodWaitError, UserAlreadyParticipantError
 from telethon.sessions import StringSession
-from telethon.tl.functions.account import UpdateStatusRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import MessageEntityTextUrl
@@ -42,8 +41,7 @@ TARGET_CHANNELS = [
 
 DEFAULT_BOT = os.environ.get("TARGET_BOT", "xrocket")
 BOT_ALIASES = {"xrocket", "tonrocketbot"}
-POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 1.5))
-ONLINE_INTERVAL = float(os.environ.get("ONLINE_INTERVAL", 25))
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 0.8))
 PING_INTERVAL = float(os.environ.get("PING_INTERVAL", 300))
 REPLY_TIMEOUT = float(os.environ.get("REPLY_TIMEOUT", 6))
 MAX_ROUNDS = int(os.environ.get("MAX_ROUNDS", 4))
@@ -440,16 +438,6 @@ class XRocketSniper:
     async def on_edit_post(self, event):
         self.spawn(self.process_message(event.message, "push (edit)", time.time()))
 
-    async def keep_online(self):
-        while True:
-            try:
-                await self.client(UpdateStatusRequest(offline=False))
-            except FloodWaitError as err:
-                await asyncio.sleep(err.seconds)
-            except Exception:
-                pass
-            await asyncio.sleep(ONLINE_INTERVAL)
-
     async def self_ping(self):
         url = os.environ.get("RENDER_EXTERNAL_URL")
         if not url:
@@ -552,7 +540,6 @@ class XRocketSniper:
         for index, target in enumerate(self.channel_entities):
             self.spawn(self.fast_channel_tracker(target, stagger_delay=index * 0.2))
 
-        self.spawn(self.keep_online())
         if SELF_PING:
             self.spawn(self.self_ping())
 
@@ -581,8 +568,12 @@ def validate_config():
         sys.exit(1)
 
 
+async def main():
+    sniper = XRocketSniper(SESSION_STRING, API_ID, API_HASH)
+    await sniper.start()
+
+
 if __name__ == "__main__":
     validate_config()
     threading.Thread(target=run_flask, daemon=True).start()
-    sniper = XRocketSniper(SESSION_STRING, API_ID, API_HASH)
-    asyncio.run(sniper.start())
+    asyncio.run(main())
