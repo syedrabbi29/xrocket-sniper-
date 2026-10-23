@@ -44,10 +44,15 @@ BOT_ALIASES = {"xrocket", "tonrocketbot"}
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 0.8))
 PING_INTERVAL = float(os.environ.get("PING_INTERVAL", 300))
 REPLY_TIMEOUT = float(os.environ.get("REPLY_TIMEOUT", 6))
-MAX_ROUNDS = int(os.environ.get("MAX_ROUNDS", 4))
+MAX_ROUNDS = int(os.environ.get("MAX_ROUNDS", 6))
 AUTO_JOIN = env_flag("AUTO_JOIN", True)
 JOIN_TARGETS = env_flag("JOIN_TARGETS", True)
 SELF_PING = env_flag("SELF_PING", True)
+WATCH_ALL = env_flag("WATCH_ALL", not TARGET_CHANNELS)
+DIALOG_POLL = env_flag("DIALOG_POLL", True)
+DIALOG_POLL_INTERVAL = float(os.environ.get("DIALOG_POLL_INTERVAL", 1.5))
+DIALOG_LIMIT = int(os.environ.get("DIALOG_LIMIT", 100))
+DIALOG_MAX_AGE = float(os.environ.get("DIALOG_MAX_AGE", 60))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET_HOURS", 6))))
 
 LINK_PATTERNS = [
@@ -69,6 +74,7 @@ EXPIRED_WORDS = ["already", "expired", "not found", "empty", "no longer", "уж�
 PREMIUM_WORDS = ["premium", "премиум"]
 CAPTCHA_WORDS = ["captcha", "капча"]
 CHECK_WORDS = ["check", "claim", "done", "subscribed", "activate", "receive", "проверить", "получить", "готово", "подписал", "активировать", "✅"]
+PENDING_WORDS = ["receiving", "processing", "pending", "⏱", "в обработке", "получение"]
 
 STATUS_LABEL = {
     "claimed": ("✅", "Cheque Claimed"),
@@ -115,6 +121,11 @@ def classify(text):
     return None
 
 
+def is_pending(text):
+    low = text.lower()
+    return any(w in low for w in PENDING_WORDS)
+
+
 def parse_reward(msg):
     m = CHEQUE_TEXT_RE.search(msg.raw_text or "")
     if m:
@@ -148,6 +159,7 @@ class XRocketSniper:
         self.channel_entities = {}
         self.titles = {}
         self.bot_entity = None
+        self.bot_chat_id = None
         self.inbox = {}
         self.inbox_seq = 0
         self.result_lock = asyncio.Lock()
@@ -268,10 +280,13 @@ class XRocketSniper:
     async def resolve(self, sent_id, seq_at_send):
         min_seq = seq_at_send
         last_text, last_ts = "", time.time()
+        pending = False
 
         for _ in range(MAX_ROUNDS):
             entry = await self.wait_inbox(sent_id, min_seq)
             if not entry:
+                if pending:
+                    return "claimed", last_text, last_ts
                 return ("no_reply" if not last_text else "unknown"), last_text, last_ts
 
             msg, recv_ts, seq = entry
@@ -283,10 +298,16 @@ class XRocketSniper:
                 return status, text, recv_ts
 
             min_seq = self.inbox_seq
-            if not await self.act_on_buttons(msg):
-                return "unknown", text, recv_ts
 
-        return "unknown", last_text, last_ts
+            if is_pending(text):
+                pending = True
+                continue
+
+            if not await self.act_on_buttons(msg):
+                return ("claimed" if pending else "unknown"), text, recv_ts
+            pending = False
+
+        return ("claimed" if pending else "unknown"), last_text, last_ts
 
     async def fire_claim(self, info):
         key = info["payload"]
@@ -407,6 +428,9 @@ class XRocketSniper:
         if not msg or not msg.id:
             return
 
+        if self.bot_chat_id is not None and msg.chat_id == self.bot_chat_id:
+            return
+
         key = (msg.chat_id, msg.id)
         if key in self.processed_posts:
             return
@@ -485,10 +509,55 @@ class XRocketSniper:
             except Exception:
                 await asyncio.sleep(1)
 
-    async def warm_up(self):
-        if any(isinstance(t, int) for t in TARGET_CHANNELS):
+    async def dialog_tracker(self):
+        last_seen = {}
+
+        while True:
             try:
-                await self.client.get_dialogs()
+                dialogs = await self.client.get_dialogs(limit=DIALOG_LIMIT, folder=0)
+                break
+            except FloodWaitError as err:
+                await asyncio.sleep(err.seconds + 1)
+            except Exception as err:
+                print(f"[!] Dialog tracker init error: {err}")
+                await asyncio.sleep(2)
+
+        for dialog in dialogs:
+            if dialog.message:
+                last_seen[dialog.id] = dialog.message.id
+
+        while True:
+            await asyncio.sleep(DIALOG_POLL_INTERVAL)
+            try:
+                dialogs = await self.client.get_dialogs(limit=DIALOG_LIMIT, folder=0)
+            except FloodWaitError as err:
+                await asyncio.sleep(err.seconds + 1)
+                continue
+            except Exception as err:
+                print(f"[!] Dialog tracker error: {err}")
+                await asyncio.sleep(2)
+                continue
+
+            for dialog in dialogs:
+                msg = dialog.message
+                if not msg:
+                    continue
+
+                previous = last_seen.get(dialog.id)
+                last_seen[dialog.id] = max(msg.id, previous or 0)
+
+                if previous is None:
+                    if time.time() - msg.date.timestamp() > DIALOG_MAX_AGE:
+                        continue
+                elif msg.id <= previous:
+                    continue
+
+                self.spawn(self.process_message(msg, "dialogs", time.time()))
+
+    async def warm_up(self):
+        if WATCH_ALL or any(isinstance(t, int) for t in TARGET_CHANNELS):
+            try:
+                await self.client.get_dialogs(limit=DIALOG_LIMIT)
             except Exception:
                 pass
 
@@ -508,6 +577,7 @@ class XRocketSniper:
 
         try:
             self.bot_entity = await self.client.get_input_entity(DEFAULT_BOT)
+            self.bot_chat_id = utils.get_peer_id(self.bot_entity)
             print(f"[+] Loaded bot: @{DEFAULT_BOT}")
         except Exception as err:
             print(f"[-] Could not resolve bot: {err}")
@@ -524,12 +594,17 @@ class XRocketSniper:
         await self.warm_up()
 
         watch = list(self.channel_entities.values())
-        if not watch:
+        if not watch and not WATCH_ALL:
             print("[-] No channels resolved, stopping.")
             return
 
-        self.client.add_event_handler(self.on_new_post, events.NewMessage(chats=watch))
-        self.client.add_event_handler(self.on_edit_post, events.MessageEdited(chats=watch))
+        if WATCH_ALL:
+            self.client.add_event_handler(self.on_new_post, events.NewMessage(incoming=True))
+            self.client.add_event_handler(self.on_edit_post, events.MessageEdited(incoming=True))
+        else:
+            self.client.add_event_handler(self.on_new_post, events.NewMessage(chats=watch))
+            self.client.add_event_handler(self.on_edit_post, events.MessageEdited(chats=watch))
+
         self.client.add_event_handler(self.on_bot_msg, events.NewMessage(chats=DEFAULT_BOT, incoming=True))
         self.client.add_event_handler(self.on_bot_msg, events.MessageEdited(chats=DEFAULT_BOT, incoming=True))
         self.client.add_event_handler(
@@ -540,16 +615,25 @@ class XRocketSniper:
         for index, target in enumerate(self.channel_entities):
             self.spawn(self.fast_channel_tracker(target, stagger_delay=index * 0.2))
 
+        if WATCH_ALL and DIALOG_POLL:
+            self.spawn(self.dialog_tracker())
+
         if SELF_PING:
             self.spawn(self.self_ping())
 
-        names = ", ".join(str(t) for t in self.channel_entities)
-        print(f"\n[🔥 READY] Watching {len(watch)} channels: {names}")
+        names = "ALL chats of this account" if WATCH_ALL else ", ".join(str(t) for t in self.channel_entities)
+        engine = "Push"
+        if self.channel_entities:
+            engine += f" + Channel Tracker ({POLL_INTERVAL}s)"
+        if WATCH_ALL and DIALOG_POLL:
+            engine += f" + Dialog Tracker ({DIALOG_POLL_INTERVAL}s, top {DIALOG_LIMIT})"
+
+        print(f"\n[🔥 READY] Watching: {names}")
         await self.send_log(
             f"⚡ <b>xRocket Sniper Running</b>\n"
             f"👤 User: <b>{html.escape(me.first_name or '')}</b>\n"
             f"🎯 Watching: <code>{html.escape(names)}</code>\n"
-            f"⏱ Engine: Push + Fast Tracker ({POLL_INTERVAL}s)\n"
+            f"⏱ Engine: {engine}\n"
             f"📊 Send <code>stats</code> to Saved Messages for a summary"
         )
         await self.client.run_until_disconnected()
@@ -560,7 +644,6 @@ def validate_config():
         "API_ID": API_ID,
         "API_HASH": API_HASH,
         "SESSION_STRING": SESSION_STRING,
-        "TARGET_CHANNELS": TARGET_CHANNELS,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
